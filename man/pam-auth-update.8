@@ -1,0 +1,222 @@
+.TH PAM-AUTH-UPDATE 8 "2026-11-21" "pam-utils" "System Administration"
+.SH NAME
+pam-auth-update \- write the common PAM configuration from profiles
+.SH SYNOPSIS
+.B pam-auth-update
+.RB [ \-\-enable
+.IR profile " ...]"
+.RB [ \-\-disable
+.IR profile " ...]"
+.RB [ \-\-remove
+.IR profile " ...]"
+.RB [ \-\-package ]
+.RB [ \-\-force ]
+.RB [ \-\-root
+.IR directory ]
+.br
+.B pam-auth-update \-\-list
+.RB [ \-\-root
+.IR directory ]
+.SH DESCRIPTION
+.B pam-auth-update
+writes the files
+.IR /etc/pam.d/common-auth ,
+.IR common-account ,
+.IR common-password ,
+.I common-session
+and
+.IR common-session-noninteractive .
+The PAM configuration of a service includes these files and has little
+else, so that what they say holds for all services.
+.PP
+What goes into the files comes from profiles, small files in
+.I /usr/share/pam-configs
+that packages with a PAM module bring along.
+The program puts the lines of all enabled profiles together, in the order
+of their priorities, and works out the jumps between them.
+Nobody has to write a PAM stack by hand for that.
+.PP
+Called without options it writes the files again for the profiles that
+are enabled.
+A profile that was not there the last time is enabled if it says
+.BR "Default: yes" .
+Nothing is asked.
+.PP
+This is a rewrite in shell of the program of the same name in Debian.
+The profiles and templates have the same format and the same files are
+written for them, see
+.B DIFFERENCES
+below.
+.SH OPTIONS
+.TP
+.BI \-\-enable " profile ..."
+Enable the profiles.
+It is an error to name one that is not installed.
+.TP
+.BI \-\-disable " profile ..."
+Disable the profiles.
+They stay disabled until they are enabled with
+.BR \-\-enable .
+.TP
+.BI \-\-remove " profile ..."
+Leave the profiles out as if they were not installed.
+For the script of a package that is about to be removed, while its
+profile is still there.
+.TP
+.B \-\-package
+Says that the script of a package is calling.
+If files were changed by hand, they are left alone and the exit status is
+0 all the same.
+.TP
+.B \-\-force
+Overwrite files that were changed by hand or that were not written by
+this program.
+The old file is kept with
+.I .pam-old
+at the end of its name.
+.TP
+.B \-\-list
+Print the profiles in the order of their priorities, with their state and
+description, and change nothing.
+.TP
+.BI \-\-root " directory"
+Work on the system below
+.IR directory .
+.TP
+.BR \-h ", " \-\-help
+Print a help message.
+.TP
+.B \-\-version
+Print the version.
+.SH CHANGES BY HAND
+Each of the files has four marker lines.
+The lines between the first and the second, and between the third and the
+last, are the managed block: they are written by this program.
+Everything else in the file can be changed, and modules can be added
+before the first or after the last marker.
+Such changes are kept.
+.PP
+A file whose managed block was changed, or that was not written by this
+program, is not touched.
+The program says which files these are and exits with status 2, and none
+of the five files is written.
+.B \-\-force
+overwrites the managed block of such a file.
+.SH PROFILES
+A profile is a file with fields of the form
+.BR "Key: value" .
+A field can go on over several lines, the lines after the first are
+indented.
+Lines that start with # are ignored.
+The name of the file is the name of the profile.
+.TP
+.B Name
+A description, one line.
+.TP
+.B Default
+.B yes
+if the profile is enabled when it is seen for the first time.
+.TP
+.B Priority
+A number.
+Profiles with higher numbers come first in the stack.
+.TP
+.B Conflicts
+Names of profiles this one cannot be enabled with, separated by commas.
+Of two such profiles the one with the higher priority stays.
+.TP
+.BR Auth-Type ", " Account-Type ", " Password-Type ", " Session-Type
+.B Primary
+or
+.BR Additional .
+The lines of primary profiles decide whether the stack succeeds, they come
+in front of the line that denies.
+The lines of additional profiles come after it and are run whenever the
+stack got that far.
+.TP
+.BR Auth ", " Account ", " Password ", " Session
+The lines for the stack, without the type in front: a control and a
+module, with its options.
+In a control in square brackets
+.B end
+can be given as the number of lines to jump over, it stands for the end of
+the block.
+.TP
+.BR Auth-Initial ", " Account-Initial ", " Password-Initial ", " Session-Initial
+Lines that are used in place of the ones above if the profile is the first
+one of its block.
+.TP
+.B Session-Interactive-Only
+.B yes
+if the lines for the session are not meant for
+.IR common-session-noninteractive .
+.PP
+A profile with something else in it, such as a line without a module, is
+an error and nothing is written.
+.SH EXIT STATUS
+.TP
+.B 0
+The files were written, or
+.B \-\-package
+was given and files that were changed by hand were left alone.
+.TP
+.B 1
+An error. Nothing was changed.
+.TP
+.B 2
+Files were changed by hand and
+.B \-\-force
+was not given.
+Nothing was changed.
+.SH DIFFERENCES
+What is not as in the program of Debian:
+.IP \(bu 2
+There is no dialog.
+.IP \(bu 2
+Debian's program takes options over that were added to or removed from a
+line of the managed block.
+Here a changed block stops the program.
+.IP \(bu 2
+The five files are all generated and checked before the first of them is
+replaced.
+.IP \(bu 2
+A set of profiles without a primary module for
+.B auth
+or for
+.B account
+is refused.
+With such a set every user would be let in.
+.IP \(bu 2
+.B end
+is only replaced in the control of a line, not in the name of a module.
+.IP \(bu 2
+Of two conflicting profiles the one with the lower priority is dropped,
+whichever of the two names the conflict.
+.IP \(bu 2
+.I /var/lib/pam
+has the list of enabled profiles and a copy of each file as it was
+written, not the files of Debian's program.
+.SH FILES
+.TP
+.I /etc/pam.d/common-*
+The files that are written.
+.TP
+.I /usr/share/pam-configs
+The profiles.
+.TP
+.I /usr/share/pam/common-*
+The templates new files are made from.
+.TP
+.I /var/lib/pam/enabled
+The names of the enabled profiles.
+.TP
+.I /var/lib/pam/seen
+The names of all profiles that were there at the last run.
+.TP
+.I /var/lib/pam/common-*
+The files as they were written, to tell changes by hand.
+.SH SEE ALSO
+.BR pam.conf (5),
+.BR pam (7)
+.SH AUTHORS
+The original was written by Steve Langasek for Debian and Ubuntu.

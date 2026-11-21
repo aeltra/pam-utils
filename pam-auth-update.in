@@ -1,0 +1,891 @@
+#!/bin/sh
+#
+# pam-auth-update
+#
+# Writes /etc/pam.d/common-auth, common-account, common-password,
+# common-session and common-session-noninteractive from the profiles that
+# packages install to @DATADIR@/pam-configs.
+#
+# This is a rewrite in shell and awk of the program of the same name in
+# Debian's packaging of PAM (debian/local/pam-auth-update), written by Steve
+# Langasek. The profiles and the templates have the format of the original,
+# and so has what is written for them. What is different:
+#
+#   * Nothing is asked. The original asks with debconf which profiles to
+#     enable, here that is said with --enable and --disable.
+#   * A file whose managed block was changed by hand is left alone unless
+#     --force is given. The original carries options over that were added
+#     to or taken from a line.
+#   * All five files are generated and checked before the first of them is
+#     replaced.
+#   * A set of profiles that has no module to authenticate with, or none to
+#     check the account with, is refused.
+#   * What is kept in /var/lib/pam is the list of enabled profiles and a
+#     copy of each file as it was written.
+#
+# Copyright (C) 2008 Canonical Ltd.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of version 3 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, see <https://www.gnu.org/licenses/>.
+#
+
+set -e -u
+
+###############################################################################
+# Settings
+###############################################################################
+
+PROGRAM="${0##*/}"
+VERSION="@VERSION@"
+DATA_DIR="@DATADIR@"
+
+TYPES="auth account password session session-noninteractive"
+
+ROOT=""
+FORCE="no"
+PACKAGE="no"
+LIST="no"
+
+TO_ENABLE=""
+TO_DISABLE=""
+TO_REMOVE=""
+
+###############################################################################
+# The awk part: reads the profiles, decides which of them are enabled and
+# writes one file from its template.
+###############################################################################
+
+AWK_PROGRAM=$(cat <<'AWK'
+function fail(message)
+{
+    print PROGRAM ": error: " message > "/dev/stderr"
+    exit 1
+}
+
+function warn(message)
+{
+    print PROGRAM ": " message > "/dev/stderr"
+}
+
+function trim(text)
+{
+    sub(/^[ \t\r]+/, "", text)
+    sub(/[ \t\r]+$/, "", text)
+    return text
+}
+
+function starts_with(text, prefix)
+{
+    return substr(text, 1, length(prefix)) == prefix
+}
+
+# Fills the set with the words of a list.
+function to_set(list, set,    words, n, i)
+{
+    n = split(list, words, /[ \t\n]+/)
+
+    for (i = 1; i <= n; i++) {
+        if (words[i] != "") {
+            set[words[i]] = 1
+        }
+    }
+}
+
+function profile_name(file,    name)
+{
+    name = file
+    sub(/^.*\//, "", name)
+    return name
+}
+
+# "Key: value" starts a field, every other line is one more line of the
+# field before it.
+function read_profile(file,    name, key, line, result)
+{
+    name = profile_name(file)
+    key = ""
+
+    while ((result = (getline line < file)) > 0) {
+        if (line ~ /^#/) {
+            continue
+        }
+
+        if (match(line, /^[^ \t]+:([ \t]|$)/)) {
+            key = substr(line, 1, RLENGTH)
+            sub(/:[ \t]?$/, "", key)
+            # The first version of the format called "Auth" "Auth-Final".
+            sub(/-Final$/, "", key)
+            FIELD[name, key] = trim(substr(line, RLENGTH + 1))
+            continue
+        }
+
+        line = trim(line)
+
+        if (line == "" || key == "") {
+            continue
+        }
+
+        if (FIELD[name, key] == "") {
+            FIELD[name, key] = line
+        } else {
+            FIELD[name, key] = FIELD[name, key] "\n" line
+        }
+
+        # pam_tally is gone from PAM, a profile that has it cannot work.
+        if (line ~ /pam_tally/) {
+            UNUSABLE[name] = 1
+        }
+    }
+
+    if (result < 0) {
+        fail("cannot read " file ".")
+    }
+
+    close(file)
+
+    if (name in UNUSABLE) {
+        warn("profile " name " uses pam_tally and is ignored.")
+        return
+    }
+
+    check_profile(name)
+    PROFILE[name] = 1
+    PRIORITY[name] = FIELD[name, "Priority"] + 0
+}
+
+function check_profile(name,    i, key, kind, text, lines, n, j)
+{
+    if (FIELD[name, "Name"] == "") {
+        fail("profile " name " has no Name.")
+    }
+
+    if (FIELD[name, "Priority"] !~ /^[0-9]+$/) {
+        fail("profile " name " has no Priority, or one that is no number.")
+    }
+
+    if (FIELD[name, "Session-Interactive-Only"] != "yes") {
+        FIELD[name, "Session-noninteractive-Type"] = \
+            FIELD[name, "Session-Type"]
+        FIELD[name, "Session-noninteractive"] = FIELD[name, "Session"]
+        FIELD[name, "Session-noninteractive-Initial"] = \
+            FIELD[name, "Session-Initial"]
+    }
+
+    for (i = 1; i <= TYPE_COUNT; i++) {
+        key = FIELD_NAME[i]
+        kind = FIELD[name, key "-Type"]
+        text = FIELD[name, key]
+
+        if (FIELD[name, key "-Initial"] != "") {
+            text = text "\n" FIELD[name, key "-Initial"]
+        }
+
+        if (kind == "" && trim(text) == "") {
+            continue
+        }
+
+        if (kind != "Primary" && kind != "Additional") {
+            fail("profile " name ": " key "-Type is neither Primary nor " \
+                "Additional.")
+        }
+
+        n = split(text, lines, /\n+/)
+
+        for (j = 1; j <= n; j++) {
+            if (lines[j] != "" && lines[j] !~ MODULE_LINE) {
+                fail("profile " name ": \"" lines[j] "\" is not a line " \
+                    "for a PAM configuration.")
+            }
+        }
+    }
+}
+
+# Higher priorities come first, of two profiles with the same priority the
+# one that is later in the alphabet.
+function comes_before(a, b)
+{
+    if (PRIORITY[a] != PRIORITY[b]) {
+        return PRIORITY[a] > PRIORITY[b]
+    }
+
+    return a > b
+}
+
+# Puts the names of a set in order. Returns how many there are.
+function sort_names(set, names,    name, n, i, j)
+{
+    n = 0
+
+    for (name in set) {
+        for (i = n; i >= 1 && comes_before(name, names[i]); i--) {
+            names[i + 1] = names[i]
+        }
+
+        names[i + 1] = name
+        n++
+    }
+
+    return n
+}
+
+function conflict_between(a, b,    names, n, i)
+{
+    n = split(FIELD[a, "Conflicts"], names, /,[ \t]*/)
+
+    for (i = 1; i <= n; i++) {
+        if (names[i] == b) {
+            return 1
+        }
+    }
+
+    return 0
+}
+
+###############################################################################
+# Mode "select": prints "S <name>" for every profile there is and
+# "E <name>" for every one that is to be enabled, both in order.
+###############################################################################
+
+function select_profiles(    known, enabled, seen, removed, wanted, unwanted,
+        names, count, name, i, j, left)
+{
+    to_set(ENVIRON["PAU_REMOVE"], removed)
+    to_set(ENVIRON["PAU_OLD_ENABLED"], enabled)
+    to_set(ENVIRON["PAU_OLD_SEEN"], seen)
+    to_set(ENVIRON["PAU_ENABLE"], wanted)
+    to_set(ENVIRON["PAU_DISABLE"], unwanted)
+
+    for (name in PROFILE) {
+        if (!(name in removed)) {
+            known[name] = 1
+        }
+    }
+
+    # What is enabled so far, without the profiles that are gone.
+    for (name in enabled) {
+        if (!(name in known)) {
+            delete enabled[name]
+        }
+    }
+
+    for (name in wanted) {
+        if (!(name in PROFILE)) {
+            fail("there is no profile named " name ".")
+        }
+
+        if (name in known) {
+            enabled[name] = 1
+        }
+    }
+
+    for (name in unwanted) {
+        delete enabled[name]
+        seen[name] = 1
+    }
+
+    # With nothing enabled the defaults apply again, as on the first run.
+    left = 0
+
+    for (name in enabled) {
+        left++
+    }
+
+    if (left == 0) {
+        for (name in seen) {
+            if (!(name in unwanted)) {
+                delete seen[name]
+            }
+        }
+    }
+
+    # A profile that was not there before is enabled if it says so.
+    for (name in known) {
+        if (FIELD[name, "Default"] == "yes" && !(name in seen)) {
+            enabled[name] = 1
+        }
+    }
+
+    # Of two profiles that do not go together the first one stays.
+    count = sort_names(enabled, names)
+
+    for (i = 1; i <= count; i++) {
+        if (!(names[i] in enabled)) {
+            continue
+        }
+
+        for (j = i + 1; j <= count; j++) {
+            if (!(names[j] in enabled)) {
+                continue
+            }
+
+            if (conflict_between(names[i], names[j]) ||
+                    conflict_between(names[j], names[i])) {
+                warn("profile " names[j] " conflicts with " names[i] \
+                    " and is not enabled.")
+                delete enabled[names[j]]
+            }
+        }
+    }
+
+    left = 0
+
+    for (i = 1; i <= count; i++) {
+        if (names[i] in enabled) {
+            print "E " names[i]
+            left++
+        }
+    }
+
+    if (left == 0) {
+        fail("no profile would be enabled.")
+    }
+
+    count = sort_names(known, names)
+
+    for (i = 1; i <= count; i++) {
+        print "S " names[i]
+    }
+}
+
+###############################################################################
+# Mode "list": prints every profile with its state and its description.
+###############################################################################
+
+function list_profiles(    enabled, names, count, i)
+{
+    to_set(ENVIRON["PAU_OLD_ENABLED"], enabled)
+    count = sort_names(PROFILE, names)
+
+    for (i = 1; i <= count; i++) {
+        printf "%-20s %-9s %s\n", names[i],
+            (names[i] in enabled) ? "enabled" : "disabled",
+            FIELD[names[i], "Name"]
+    }
+}
+
+###############################################################################
+# Mode "generate": prints the file of one type, made from its template and
+# the enabled profiles.
+###############################################################################
+
+# The lines a profile has for the current type. The first profile of a
+# block may have lines of its own for that place.
+function lines_of(name, position)
+{
+    if (position == 0 && FIELD[name, CURRENT_FIELD "-Initial"] != "") {
+        return FIELD[name, CURRENT_FIELD "-Initial"]
+    }
+
+    return FIELD[name, CURRENT_FIELD]
+}
+
+# A jump to "end" becomes a jump over the lines that are left in the block.
+function finish_line(line, jump,    head, control, rest, words, n, i)
+{
+    match(line, MODULE_LINE)
+    head = substr(line, 1, RLENGTH)
+    rest = substr(line, RLENGTH + 1)
+
+    if (head ~ /^\[/) {
+        control = substr(head, 1, index(head, "]"))
+        head = substr(head, length(control) + 1)
+        gsub(/=end/, "=" jump, control)
+        head = control head
+    }
+
+    n = split(rest, words, /[ \t]+/)
+
+    for (i = 1; i <= n; i++) {
+        if (words[i] != "") {
+            head = head " " words[i]
+        }
+    }
+
+    return head
+}
+
+function write_block(kind,    i, position, count, lines, n, j, name)
+{
+    # The number of lines comes first, the jumps depend on it.
+    count = 0
+    position = 0
+
+    for (i = 1; i <= ENABLED_COUNT; i++) {
+        name = ENABLED[i]
+
+        if (FIELD[name, CURRENT_FIELD "-Type"] != kind) {
+            continue
+        }
+
+        n = split(lines_of(name, position++), lines, /\n+/)
+
+        for (j = 1; j <= n; j++) {
+            if (lines[j] != "") {
+                count++
+            }
+        }
+    }
+
+    if (kind == "Primary" && count == 0) {
+        if (CURRENT_TYPE == "auth" || CURRENT_TYPE == "account") {
+            fail("no enabled profile has a module for " CURRENT_TYPE \
+                ", everybody would be let in.")
+        }
+
+        # Keeps the stack intact, the jump leads over the line that denies.
+        print CURRENT_TYPE "\t[default=1]\t\t\tpam_permit.so"
+    }
+
+    # Nothing in the second block may jump further than to its end.
+    if (kind == "Additional") {
+        count--
+    }
+
+    position = 0
+
+    for (i = 1; i <= ENABLED_COUNT; i++) {
+        name = ENABLED[i]
+
+        if (FIELD[name, CURRENT_FIELD "-Type"] != kind) {
+            continue
+        }
+
+        n = split(lines_of(name, position++), lines, /\n+/)
+
+        for (j = 1; j <= n; j++) {
+            if (lines[j] != "") {
+                print CURRENT_TYPE "\t" finish_line(lines[j], count)
+                count--
+            }
+        }
+    }
+}
+
+function generate(    template, state, line, result)
+{
+    template = ENVIRON["PAU_TEMPLATE"]
+    state = 0
+
+    while ((result = (getline line < template)) > 0) {
+        if (state == 1) {
+            if (starts_with(line, MARKER_FALLBACK)) {
+                print line
+                state = 2
+            }
+
+            continue
+        }
+
+        if (state == 3) {
+            if (starts_with(line, MARKER_END)) {
+                print line
+                state = 4
+            }
+
+            continue
+        }
+
+        print line
+
+        if (state == 0 && starts_with(line, MARKER_PRIMARY)) {
+            write_block("Primary")
+            state = 1
+        } else if (state == 2 && starts_with(line, MARKER_ADDITIONAL)) {
+            write_block("Additional")
+            state = 3
+        }
+    }
+
+    if (result < 0) {
+        fail("cannot read " template ".")
+    }
+
+    if (state != 4) {
+        fail(template " does not have the four lines that mark what " \
+            "is managed.")
+    }
+}
+
+###############################################################################
+# Mode "block": prints what is between the markers of a file, which is the
+# part that is managed. Fails if a marker is missing.
+###############################################################################
+
+function print_block(    file, state, line, result)
+{
+    file = ENVIRON["PAU_FILE"]
+    state = 0
+
+    while ((result = (getline line < file)) > 0) {
+        if (state == 0 && starts_with(line, MARKER_PRIMARY)) {
+            state = 1
+        } else if (state == 1 && starts_with(line, MARKER_FALLBACK)) {
+            state = 2
+        } else if (state == 2 && starts_with(line, MARKER_ADDITIONAL)) {
+            state = 3
+        } else if (state == 3 && starts_with(line, MARKER_END)) {
+            state = 4
+        } else if (state == 1 || state == 3) {
+            print state ":" line
+        }
+    }
+
+    if (result < 0 || state != 4) {
+        exit 1
+    }
+}
+
+BEGIN {
+    PROGRAM = ENVIRON["PAU_PROGRAM"]
+
+    MARKER_PRIMARY = \
+        "# here are the per-package modules (the \"Primary\" block)"
+    MARKER_FALLBACK = "# here's the fallback if no module succeeds"
+    MARKER_ADDITIONAL = \
+        "# and here are more per-package modules (the \"Additional\" block)"
+    MARKER_END = "# end of pam-auth-update config"
+
+    # What a line of a profile starts with: the control and the module.
+    MODULE_LINE = "^(\\[[^]]+\\]|[A-Za-z0-9_]+)[ \t]+[^ \t]+"
+
+    TYPE_COUNT = split("Auth Account Password Session Session-noninteractive",
+        FIELD_NAME, " ")
+
+    if (ENVIRON["PAU_MODE"] == "block") {
+        print_block()
+        exit 0
+    }
+
+    FILE_COUNT = split(ENVIRON["PAU_PROFILES"], FILES, "\n")
+
+    for (I = 1; I <= FILE_COUNT; I++) {
+        if (FILES[I] != "") {
+            read_profile(FILES[I])
+        }
+    }
+
+    if (ENVIRON["PAU_MODE"] == "select") {
+        select_profiles()
+    } else if (ENVIRON["PAU_MODE"] == "list") {
+        list_profiles()
+    } else if (ENVIRON["PAU_MODE"] == "generate") {
+        ENABLED_COUNT = split(ENVIRON["PAU_ENABLED"], ENABLED, /[ \t\n]+/)
+
+        CURRENT_TYPE = ENVIRON["PAU_TYPE"]
+        CURRENT_FIELD = toupper(substr(CURRENT_TYPE, 1, 1)) \
+            substr(CURRENT_TYPE, 2)
+        sub(/-noninteractive$/, "", CURRENT_TYPE)
+
+        generate()
+    }
+
+    exit 0
+}
+AWK
+)
+
+###############################################################################
+# Helpers
+###############################################################################
+
+usage()
+{
+    cat <<USAGE
+Writes the files /etc/pam.d/common-* from the profiles that packages have
+installed to $DATA_DIR/pam-configs.
+
+USAGE:
+
+  pam-auth-update [OPTIONS]
+
+OPTIONS:
+
+  --enable <profile> ...   Enable these profiles.
+  --disable <profile> ...  Disable these profiles.
+  --remove <profile> ...   Leave these profiles out, as if they were not
+                           installed. For a package that is being removed.
+  --package                Say that a package script is calling. Files that
+                           were changed by hand are then left alone without
+                           this counting as a failure.
+  --force                  Overwrite files that were changed by hand. A copy
+                           of each is kept with ".pam-old" at its name.
+  --list                   Print the profiles and whether they are enabled,
+                           and change nothing.
+  --root <directory>       Work on the system in this directory.
+  -h, --help               Print this help message.
+  --version                Print the version.
+
+Without --enable and --disable the files are written again for the
+profiles that are enabled already, and for the ones that are new and say
+that they are enabled by default.
+USAGE
+}
+
+die()
+{
+    echo "$PROGRAM: error: $1" >&2
+    exit 1
+}
+
+info()
+{
+    echo "$PROGRAM: $1" >&2
+}
+
+run_awk()
+{
+    PAU_PROGRAM="$PROGRAM" PAU_MODE="$1" PAU_PROFILES="$PROFILE_FILES" \
+        awk "$AWK_PROGRAM"
+}
+
+# Prints the files that are profiles, one per line.
+find_profiles()
+{
+    for _file in "$PROFILE_DIR"/*; do
+        [ -f "$_file" ] || continue
+
+        case "${_file##*/}" in
+            *~|"#"*"#")
+                ;;
+            *[!A-Za-z0-9._+-]*)
+                info "profile \"${_file##*/}\" has a name that cannot be \
+used and is ignored."
+                ;;
+            *)
+                echo "$_file"
+                ;;
+        esac
+    done
+}
+
+# Prints what is between the markers of a file, fails without the markers.
+managed_block()
+{
+    PAU_PROGRAM="$PROGRAM" PAU_MODE="block" PAU_FILE="$1" awk "$AWK_PROGRAM"
+}
+
+same_managed_block()
+{
+    _block_a="$(managed_block "$1")" || return 1
+    _block_b="$(managed_block "$2")" || return 1
+
+    [ "$_block_a" = "$_block_b" ]
+}
+
+remove_new_files()
+{
+    for _type in $TYPES; do
+        rm -f "$CONF_DIR/common-$_type.pam-new" \
+            "$STATE_DIR/common-$_type.new"
+    done
+
+    rm -f "$STATE_DIR/seen.new" "$STATE_DIR/enabled.new"
+}
+
+###############################################################################
+# Main
+###############################################################################
+
+LIST_OPTION=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --version)
+            echo "$PROGRAM $VERSION"
+            exit 0
+            ;;
+        --force)
+            FORCE="yes"
+            LIST_OPTION=""
+            ;;
+        --package)
+            PACKAGE="yes"
+            LIST_OPTION=""
+            ;;
+        --list)
+            LIST="yes"
+            LIST_OPTION=""
+            ;;
+        --root)
+            [ "$#" -ge 2 ] || die "--root needs a directory."
+            ROOT="${2%/}"
+            LIST_OPTION=""
+            shift
+            ;;
+        --enable|--disable|--remove)
+            LIST_OPTION="$1"
+            ;;
+        -*)
+            usage >&2
+            exit 1
+            ;;
+        *)
+            case "$LIST_OPTION" in
+                --enable)
+                    TO_ENABLE="$TO_ENABLE $1"
+                    ;;
+                --disable)
+                    TO_DISABLE="$TO_DISABLE $1"
+                    ;;
+                --remove)
+                    TO_REMOVE="$TO_REMOVE $1"
+                    ;;
+                *)
+                    usage >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+    esac
+
+    shift
+done
+
+PROFILE_DIR="$ROOT$DATA_DIR/pam-configs"
+TEMPLATE_DIR="$ROOT$DATA_DIR/pam"
+CONF_DIR="$ROOT/etc/pam.d"
+STATE_DIR="$ROOT/var/lib/pam"
+
+[ -d "$PROFILE_DIR" ] || die "there is no directory $PROFILE_DIR."
+
+PROFILE_FILES="$(find_profiles)"
+OLD_ENABLED=""
+OLD_SEEN=""
+
+if [ -f "$STATE_DIR/enabled" ]; then
+    OLD_ENABLED="$(cat "$STATE_DIR/enabled")"
+fi
+
+if [ -f "$STATE_DIR/seen" ]; then
+    OLD_SEEN="$(cat "$STATE_DIR/seen")"
+fi
+
+if [ "$LIST" = "yes" ]; then
+    PAU_OLD_ENABLED="$OLD_ENABLED" run_awk list
+    exit 0
+fi
+
+if [ -z "$ROOT" ] && [ "$(id -u)" -ne 0 ]; then
+    die "this needs to be run as root."
+fi
+
+#
+# Which profiles are enabled.
+#
+
+SELECTION="$(PAU_OLD_ENABLED="$OLD_ENABLED" PAU_OLD_SEEN="$OLD_SEEN" \
+    PAU_ENABLE="$TO_ENABLE" PAU_DISABLE="$TO_DISABLE" \
+    PAU_REMOVE="$TO_REMOVE" run_awk select)" || exit 1
+
+ENABLED="$(echo "$SELECTION" | sed -n 's/^E //p')"
+SEEN="$(echo "$SELECTION" | sed -n 's/^S //p')"
+
+#
+# What each file is made from. A file that is as it was written, or that
+# is not there, is made from the template that came with this program. One
+# that was changed outside of the managed block is its own template, so
+# that the changes stay. One whose managed block was changed, or that was
+# not written by this program, is not touched without --force.
+#
+
+CHANGED=""
+
+for TYPE in $TYPES; do
+    TARGET="$CONF_DIR/common-$TYPE"
+    SAVED="$STATE_DIR/common-$TYPE"
+    TEMPLATE="$TEMPLATE_DIR/common-$TYPE"
+    BACKUP="no"
+
+    [ -f "$TEMPLATE" ] || die "there is no template $TEMPLATE."
+
+    if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+        if [ -f "$SAVED" ] && cmp -s "$TARGET" "$SAVED"; then
+            :
+        elif [ -f "$SAVED" ] && same_managed_block "$TARGET" "$SAVED"; then
+            TEMPLATE="$TARGET"
+        else
+            CHANGED="$CHANGED $TARGET"
+            BACKUP="yes"
+
+            if managed_block "$TARGET" > /dev/null; then
+                TEMPLATE="$TARGET"
+            fi
+        fi
+    fi
+
+    eval "TEMPLATE_$(echo "$TYPE" | tr '-' '_')=\"\$TEMPLATE\""
+    eval "BACKUP_$(echo "$TYPE" | tr '-' '_')=\"\$BACKUP\""
+done
+
+if [ -n "$CHANGED" ] && [ "$FORCE" != "yes" ]; then
+    info "these files were changed by hand or not written by this program:"
+
+    for TARGET in $CHANGED; do
+        info "  $TARGET"
+    done
+
+    info "Nothing was updated. Run \"$PROGRAM --force\" to overwrite them."
+
+    if [ "$PACKAGE" = "yes" ]; then
+        exit 0
+    fi
+
+    exit 2
+fi
+
+#
+# Write all files next to the ones they replace, and replace them only when
+# all of them are there.
+#
+
+umask 022
+mkdir -p "$CONF_DIR" "$STATE_DIR"
+
+trap remove_new_files EXIT
+trap 'exit 1' HUP INT TERM
+
+for TYPE in $TYPES; do
+    eval "TEMPLATE=\"\$TEMPLATE_$(echo "$TYPE" | tr '-' '_')\""
+
+    PAU_ENABLED="$ENABLED" PAU_TYPE="$TYPE" PAU_TEMPLATE="$TEMPLATE" \
+        run_awk generate > "$CONF_DIR/common-$TYPE.pam-new" || exit 1
+
+    # The result has to be something this program would take as its own.
+    managed_block "$CONF_DIR/common-$TYPE.pam-new" > /dev/null || \
+        die "the new common-$TYPE is not complete, nothing was changed."
+
+    cp "$CONF_DIR/common-$TYPE.pam-new" "$STATE_DIR/common-$TYPE.new"
+done
+
+echo "$ENABLED" > "$STATE_DIR/enabled.new"
+echo "$SEEN" > "$STATE_DIR/seen.new"
+
+for TYPE in $TYPES; do
+    TARGET="$CONF_DIR/common-$TYPE"
+    eval "BACKUP=\"\$BACKUP_$(echo "$TYPE" | tr '-' '_')\""
+
+    if [ "$BACKUP" = "yes" ]; then
+        cp -f "$TARGET" "$TARGET.pam-old"
+    fi
+
+    mv -f "$TARGET.pam-new" "$TARGET"
+    mv -f "$STATE_DIR/common-$TYPE.new" "$STATE_DIR/common-$TYPE"
+done
+
+mv -f "$STATE_DIR/enabled.new" "$STATE_DIR/enabled"
+mv -f "$STATE_DIR/seen.new" "$STATE_DIR/seen"
+
+exit 0

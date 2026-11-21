@@ -1,0 +1,28 @@
+#
+# /etc/pam.d/common-session-noninteractive - session-related modules
+# common to all non-interactive services
+#
+# This file is included from the PAM configuration of the single services.
+# It has the modules for what is done at the beginning and at the end of
+# a session that nobody sits in front of.
+#
+# This file is managed by pam-auth-update. The lines between the first and
+# the second marker below, and between the third and the last, are written
+# by it from the profiles in /usr/share/pam-configs and must not be changed
+# by hand. Modules of your own go before the first or after the last
+# marker. See pam-auth-update(8).
+#
+
+# here are the per-package modules (the "Primary" block)
+$session_nonint_primary
+# here's the fallback if no module succeeds
+session	requisite			pam_deny.so
+# prime the stack with a positive return value if there isn't one already;
+# this avoids us returning an error just because nothing sets a success code
+# since the modules above will each just jump around
+session	required			pam_permit.so
+# reset the umask for new sessions
+session optional			pam_umask.so
+# and here are more per-package modules (the "Additional" block)
+$session_nonint_additional
+# end of pam-auth-update config

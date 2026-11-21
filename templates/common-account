@@ -1,0 +1,26 @@
+#
+# /etc/pam.d/common-account - authorization settings common to all services
+#
+# This file is included from the PAM configuration of the single services.
+# It has the modules that say who is given access to this system. The
+# default is to turn away only users whose account has expired according
+# to /etc/shadow.
+#
+# This file is managed by pam-auth-update. The lines between the first and
+# the second marker below, and between the third and the last, are written
+# by it from the profiles in /usr/share/pam-configs and must not be changed
+# by hand. Modules of your own go before the first or after the last
+# marker. See pam-auth-update(8).
+#
+
+# here are the per-package modules (the "Primary" block)
+$account_primary
+# here's the fallback if no module succeeds
+account	requisite			pam_deny.so
+# prime the stack with a positive return value if there isn't one already;
+# this avoids us returning an error just because nothing sets a success code
+# since the modules above will each just jump around
+account	required			pam_permit.so
+# and here are more per-package modules (the "Additional" block)
+$account_additional
+# end of pam-auth-update config
