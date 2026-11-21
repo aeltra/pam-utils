@@ -778,10 +778,6 @@ if [ "$LIST" = "yes" ]; then
     exit 0
 fi
 
-if [ -z "$ROOT" ] && [ "$(id -u)" -ne 0 ]; then
-    die "this needs to be run as root."
-fi
-
 #
 # Which profiles are enabled.
 #
