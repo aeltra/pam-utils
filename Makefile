@@ -6,10 +6,6 @@ DATADIR = $(PREFIX)/share
 MANDIR = $(DATADIR)/man
 DESTDIR =
 
-# The algorithm pam_unix hashes new passwords with, in the profile "unix".
-# musl cannot do yescrypt, there it has to be sha512.
-PASSWORD_HASH = yescrypt
-
 TEMPLATES = \
 	templates/common-account \
 	templates/common-auth \
@@ -19,16 +15,12 @@ TEMPLATES = \
 
 .PHONY: all check install clean dist
 
-all: pam-auth-update profiles/unix
+all: pam-auth-update
 
 pam-auth-update: pam-auth-update.in Makefile
 	sed -e 's|@DATADIR@|$(DATADIR)|g' -e 's|@VERSION@|$(VERSION)|g' \
 		pam-auth-update.in > pam-auth-update
 	chmod 0755 pam-auth-update
-
-profiles/unix: profiles/unix.in Makefile
-	sed -e 's|@PASSWORD_HASH@|$(PASSWORD_HASH)|g' \
-		profiles/unix.in > profiles/unix
 
 check: all
 	sh tests/run-tests
@@ -45,7 +37,7 @@ install: all
 	install -m 0644 man/pam-auth-update.8 $(DESTDIR)$(MANDIR)/man8/
 
 clean:
-	rm -f pam-auth-update profiles/unix
+	rm -f pam-auth-update
 
 dist:
 	git archive --prefix=pam-utils-$(VERSION)/ \

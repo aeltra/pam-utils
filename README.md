@@ -18,8 +18,8 @@ formats are Debian's:
 * A profile of a Debian package can be used as it is.
 * The templates in `templates/` have Debian's marker lines and Debian's
   lines between them, with comments of our own.
-* `profiles/unix.in` is Debian's profile for pam_unix, with the algorithm
-  for password hashes left open (`PASSWORD_HASH`).
+* `profiles/unix` is Debian's profile for pam_unix, with sha512 for new
+  password hashes where Debian has yescrypt (see below).
 * For the same profiles and templates the same files are written, except
   that Debian's program leaves a blank at the end of a line without
   options.
@@ -33,16 +33,19 @@ and lifts that restriction again. See the comment at the top of the script.
 
 ## Building and installing
 
-    make [PREFIX=/usr] [PASSWORD_HASH=yescrypt|sha512]
+    make [PREFIX=/usr]
     make check
     make install [DESTDIR=...]
 
 Nothing is compiled. The programs need a POSIX shell, awk, sed, cmp and
 the usual file tools at run time.
 
-`PASSWORD_HASH` is the algorithm pam_unix hashes new passwords with. The
-default is yescrypt, as in Debian. The `crypt` of musl cannot do yescrypt,
-on a system where PAM uses it this has to be sha512.
+## Password hashes
+
+The profile `unix` tells pam_unix to hash new passwords with sha512.
+Debian has yescrypt there. The `crypt` of musl cannot do yescrypt, and
+Aeltra OS is built with musl and with glibc: sha512 is what both can
+check, so that an /etc/shadow can be taken from one system to the other.
 
 ## Tests
 

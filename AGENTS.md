@@ -28,8 +28,9 @@ tests pass and a test for it has been added.
   file is installed.
 * `pam-securetty`: installed as it is.
 * `templates/common-*`: what a new file is made from.
-* `profiles/unix.in`: the profile for pam_unix. `make` fills in
-  `@PASSWORD_HASH@` and writes `profiles/unix`, which is not checked in.
+* `profiles/unix`: the profile for pam_unix. It is Debian's, with sha512
+  for new password hashes in place of yescrypt: musl cannot do yescrypt,
+  and the hashes have to work on musl and on glibc systems alike.
 * `man/pam-auth-update.8`: the manual page, written in roff by hand.
 * `tests/run-tests`: the tests, with their profiles in `tests/profiles/`.
 * `tests/compare-with-debian`: compares the output with that of Debian's

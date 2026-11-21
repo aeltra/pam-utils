@@ -175,7 +175,7 @@ expect_lines "first run" account \
     "[success=1 new_authtok_reqd=done default=ignore] pam_unix.so" \
     "$DENY" "$PERMIT"
 expect_lines "first run" password \
-    "[success=1 default=ignore] pam_unix.so obscure yescrypt" \
+    "[success=1 default=ignore] pam_unix.so obscure sha512" \
     "$DENY" "$PERMIT"
 expect_lines "first run" session \
     "[default=1] pam_permit.so" "$DENY" "$PERMIT" "$UMASK" \

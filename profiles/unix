@@ -18,6 +18,6 @@ Session-Initial:
 	required	pam_unix.so
 Password-Type: Primary
 Password:
-	[success=end default=ignore]	pam_unix.so obscure use_authtok try_first_pass @PASSWORD_HASH@
+	[success=end default=ignore]	pam_unix.so obscure use_authtok try_first_pass sha512
 Password-Initial:
-	[success=end default=ignore]	pam_unix.so obscure @PASSWORD_HASH@
+	[success=end default=ignore]	pam_unix.so obscure sha512
