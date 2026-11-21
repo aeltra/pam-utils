@@ -1,0 +1,6 @@
+Name: A profile for a module that is gone
+Default: yes
+Priority: 10
+Auth-Type: Primary
+Auth:
+	required	pam_tally.so

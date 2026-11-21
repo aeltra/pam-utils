@@ -1,0 +1,8 @@
+# A comment.
+Name: Register the session with the seat
+Default: yes
+Priority: 100
+Session-Type: Additional
+Session-Interactive-Only: yes
+Session:
+	optional	pam_seat.so

@@ -1,0 +1,395 @@
+#!/bin/sh
+#
+# Tests of pam-auth-update. Run with "make check", or from the top of the
+# source tree after "make". The awk to use can be given in AWK, the shell
+# in TEST_SHELL: AWK="busybox awk" TEST_SHELL="busybox sh" sh tests/run-tests
+#
+
+set -u
+
+TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+SOURCE_DIR="$(dirname "$TESTS_DIR")"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pam-utils-tests.XXXXXX")"
+trap 'rm -r "$WORK_DIR"' EXIT
+
+TEST_SHELL="${TEST_SHELL:-sh}"
+ROOT=""
+FAILED=0
+PASSED=0
+STATUS=0
+
+# The program calls "awk", so another awk has to go by that name.
+if [ -n "${AWK:-}" ]; then
+    mkdir "$WORK_DIR/bin"
+    printf '#!/bin/sh\nexec %s "$@"\n' "$AWK" > "$WORK_DIR/bin/awk"
+    chmod 0755 "$WORK_DIR/bin/awk"
+    PATH="$WORK_DIR/bin:$PATH"
+fi
+
+###############################################################################
+# Helpers
+###############################################################################
+
+# Makes an empty system with the templates and the given profiles.
+new_root()
+{
+    ROOT="$WORK_DIR/root-$1"
+    shift
+
+    mkdir -p "$ROOT/usr/share/pam" "$ROOT/usr/share/pam-configs"
+    cp "$SOURCE_DIR"/templates/common-* "$ROOT/usr/share/pam/"
+
+    for _profile in "$@"; do
+        add_profile "$_profile"
+    done
+}
+
+add_profile()
+{
+    cp "$TESTS_DIR/profiles/$1" "$ROOT/usr/share/pam-configs/"
+}
+
+run()
+{
+    # shellcheck disable=SC2086
+    $TEST_SHELL "$SOURCE_DIR/pam-auth-update" --root "$ROOT" "$@" \
+        > "$WORK_DIR/output" 2>&1
+    STATUS="$?"
+}
+
+pass()
+{
+    PASSED=$((PASSED + 1))
+}
+
+fail()
+{
+    FAILED=$((FAILED + 1))
+    echo "FAILED: $1"
+
+    if [ -s "$WORK_DIR/output" ]; then
+        sed 's/^/    | /' "$WORK_DIR/output"
+    fi
+}
+
+expect_status()
+{
+    if [ "$STATUS" -eq "$2" ]; then
+        pass
+    else
+        fail "$1: exit status $STATUS, expected $2"
+    fi
+}
+
+# The lines of a file that are not comments, with the type taken off and
+# blanks squeezed.
+lines_of()
+{
+    grep -v '^#' "$ROOT/etc/pam.d/common-$1" | grep -v '^$' | \
+        sed -e 's/^[a-z]*[ \t]*//' -e 's/[ \t][ \t]*/ /g'
+}
+
+# $1: name of the test, $2: type, the rest: the lines that are expected
+expect_lines()
+{
+    _name="$1"
+    _type="$2"
+    shift 2
+
+    _expected="$(printf '%s\n' "$@")"
+    _found="$(lines_of "$_type")"
+
+    if [ "$_found" = "$_expected" ]; then
+        pass
+    else
+        fail "$_name: common-$_type is not as expected"
+        echo "    expected:"
+        echo "$_expected" | sed 's/^/      /'
+        echo "    found:"
+        echo "$_found" | sed 's/^/      /'
+    fi
+}
+
+expect_enabled()
+{
+    _found="$(tr '\n' ' ' < "$ROOT/var/lib/pam/enabled" | sed 's/ $//')"
+
+    if [ "$_found" = "$2" ]; then
+        pass
+    else
+        fail "$1: enabled are \"$_found\", expected \"$2\""
+    fi
+}
+
+expect_output()
+{
+    if grep -q "$2" "$WORK_DIR/output"; then
+        pass
+    else
+        fail "$1: the output does not have \"$2\""
+    fi
+}
+
+expect_same()
+{
+    if cmp -s "$2" "$3"; then
+        pass
+    else
+        fail "$1: $2 and $3 differ"
+    fi
+}
+
+expect_missing()
+{
+    if [ ! -e "$2" ]; then
+        pass
+    else
+        fail "$1: $2 is there"
+    fi
+}
+
+checksums()
+{
+    cat "$ROOT"/etc/pam.d/* "$ROOT"/var/lib/pam/* 2> /dev/null | cksum
+}
+
+DENY="requisite pam_deny.so"
+PERMIT="required pam_permit.so"
+UMASK="optional pam_umask.so"
+
+###############################################################################
+# Tests
+###############################################################################
+
+#
+# A new system with nothing but the profile for /etc/shadow.
+#
+
+new_root first unix
+run
+expect_status "first run" 0
+expect_enabled "first run" "unix"
+expect_lines "first run" auth \
+    "[success=1 default=ignore] pam_unix.so nullok" "$DENY" "$PERMIT"
+expect_lines "first run" account \
+    "[success=1 new_authtok_reqd=done default=ignore] pam_unix.so" \
+    "$DENY" "$PERMIT"
+expect_lines "first run" password \
+    "[success=1 default=ignore] pam_unix.so obscure yescrypt" \
+    "$DENY" "$PERMIT"
+expect_lines "first run" session \
+    "[default=1] pam_permit.so" "$DENY" "$PERMIT" "$UMASK" \
+    "required pam_unix.so"
+expect_lines "first run" session-noninteractive \
+    "[default=1] pam_permit.so" "$DENY" "$PERMIT" "$UMASK" \
+    "required pam_unix.so"
+expect_same "first run" "$ROOT/etc/pam.d/common-auth" \
+    "$ROOT/var/lib/pam/common-auth"
+
+BEFORE="$(checksums)"
+run
+expect_status "second run" 0
+
+if [ "$(checksums)" = "$BEFORE" ]; then
+    pass
+else
+    fail "second run: the files changed"
+fi
+
+#
+# Profiles that come later: the ones that are on by default are enabled,
+# the others are not. The jumps count the lines that follow.
+#
+
+add_profile token
+add_profile homedir
+add_profile seat
+run
+expect_status "new profiles" 0
+expect_enabled "new profiles" "token unix seat"
+expect_lines "new profiles" auth \
+    "[success=3 default=ignore] pam_token.so first" \
+    "sufficient pam_token_extra.so" \
+    "[success=1 default=ignore] pam_unix.so nullok try_first_pass" \
+    "$DENY" "$PERMIT"
+expect_lines "new profiles" account \
+    "[success=1 new_authtok_reqd=done default=ignore] pam_unix.so" \
+    "$DENY" "$PERMIT"
+expect_lines "new profiles" session \
+    "[default=1] pam_permit.so" "$DENY" "$PERMIT" "$UMASK" \
+    "required pam_unix.so" "optional pam_seat.so"
+expect_lines "new profiles" session-noninteractive \
+    "[default=1] pam_permit.so" "$DENY" "$PERMIT" "$UMASK" \
+    "required pam_unix.so"
+
+run --enable homedir
+expect_status "--enable" 0
+expect_enabled "--enable" "token unix seat homedir"
+expect_lines "--enable" session \
+    "[default=1] pam_permit.so" "$DENY" "$PERMIT" "$UMASK" \
+    "required pam_unix.so" "optional pam_seat.so" \
+    "optional pam_mkhomedir.so"
+
+run --disable token seat
+expect_status "--disable" 0
+expect_enabled "--disable" "unix homedir"
+expect_lines "--disable" auth \
+    "[success=1 default=ignore] pam_unix.so nullok" "$DENY" "$PERMIT"
+
+# What was disabled stays disabled.
+run
+expect_enabled "after --disable" "unix homedir"
+
+run --list
+expect_status "--list" 0
+expect_output "--list" "^unix  *enabled  *Unix authentication"
+expect_output "--list" "^token  *disabled "
+
+# A removed profile is new again when its package comes back.
+run --remove homedir
+expect_status "--remove" 0
+expect_enabled "--remove" "unix"
+run --enable homedir --disable homedir
+run --remove seat
+run
+expect_enabled "after --remove" "unix seat"
+
+run --enable nothing
+expect_status "unknown profile" 1
+expect_output "unknown profile" "no profile named nothing"
+
+#
+# Changes by hand.
+#
+
+new_root edits unix
+run
+
+# Outside of the managed block they stay.
+{
+    echo "auth required pam_before.so"
+    cat "$ROOT/etc/pam.d/common-auth"
+    echo "auth optional pam_after.so"
+} > "$WORK_DIR/edited"
+cp "$WORK_DIR/edited" "$ROOT/etc/pam.d/common-auth"
+add_profile token
+run
+expect_status "edit outside" 0
+expect_lines "edit outside" auth \
+    "required pam_before.so" \
+    "[success=3 default=ignore] pam_token.so first" \
+    "sufficient pam_token_extra.so" \
+    "[success=1 default=ignore] pam_unix.so nullok try_first_pass" \
+    "$DENY" "$PERMIT" \
+    "optional pam_after.so"
+
+# Inside of it they stop the program.
+sed 's/pam_unix.so nullok/pam_unix.so/' "$ROOT/etc/pam.d/common-auth" \
+    > "$WORK_DIR/edited"
+cp "$WORK_DIR/edited" "$ROOT/etc/pam.d/common-auth"
+BEFORE="$(checksums)"
+run --disable token
+expect_status "edit inside" 2
+expect_output "edit inside" "common-auth"
+
+if [ "$(checksums)" = "$BEFORE" ]; then
+    pass
+else
+    fail "edit inside: files were written"
+fi
+
+run --package --disable token
+expect_status "edit inside, --package" 0
+
+if [ "$(checksums)" = "$BEFORE" ]; then
+    pass
+else
+    fail "edit inside, --package: files were written"
+fi
+
+run --force --disable token
+expect_status "edit inside, --force" 0
+expect_same "edit inside, --force" "$WORK_DIR/edited" \
+    "$ROOT/etc/pam.d/common-auth.pam-old"
+expect_missing "edit inside, --force" "$ROOT/etc/pam.d/common-account.pam-old"
+expect_lines "edit inside, --force" auth \
+    "required pam_before.so" \
+    "[success=1 default=ignore] pam_unix.so nullok" "$DENY" "$PERMIT" \
+    "optional pam_after.so"
+
+# A file that was there before the program ran for the first time.
+new_root foreign unix
+mkdir -p "$ROOT/etc/pam.d"
+echo "auth required pam_unix.so" > "$ROOT/etc/pam.d/common-auth"
+run
+expect_status "foreign file" 2
+expect_missing "foreign file" "$ROOT/etc/pam.d/common-account"
+run --force
+expect_status "foreign file, --force" 0
+expect_lines "foreign file, --force" auth \
+    "[success=1 default=ignore] pam_unix.so nullok" "$DENY" "$PERMIT"
+
+#
+# Sets of profiles that are refused. Nothing is written for them.
+#
+
+new_root no-auth seat
+run
+expect_status "no module for auth" 1
+expect_output "no module for auth" "everybody would be let in"
+expect_missing "no module for auth" "$ROOT/etc/pam.d/common-auth"
+expect_missing "no module for auth" "$ROOT/etc/pam.d/common-session"
+expect_missing "no module for auth" "$ROOT/var/lib/pam/enabled"
+
+new_root nothing homedir
+run
+expect_status "nothing enabled" 1
+expect_output "nothing enabled" "no profile would be enabled"
+
+new_root only unix
+run
+run --disable unix
+expect_status "last profile disabled" 1
+expect_enabled "last profile disabled" "unix"
+
+new_root broken unix broken
+run
+expect_status "broken profile" 1
+expect_output "broken profile" "is not a line for a PAM configuration"
+expect_missing "broken profile" "$ROOT/etc/pam.d/common-auth"
+
+new_root tally unix tally
+run
+expect_status "profile with pam_tally" 0
+expect_enabled "profile with pam_tally" "unix"
+
+#
+# Two profiles that do not go together: the one with the higher priority
+# stays.
+#
+
+new_root conflict unix token rival
+run
+expect_status "conflict" 0
+expect_enabled "conflict" "token unix"
+expect_output "conflict" "rival conflicts with token"
+
+#
+# A template without its markers.
+#
+
+new_root template unix
+grep -v "^# end of pam-auth-update config" \
+    "$SOURCE_DIR/templates/common-session" \
+    > "$ROOT/usr/share/pam/common-session"
+run
+expect_status "template without marker" 1
+expect_missing "template without marker" "$ROOT/etc/pam.d/common-auth"
+expect_missing "template without marker" \
+    "$ROOT/etc/pam.d/common-session.pam-new"
+
+###############################################################################
+
+echo "$PASSED checks passed, $FAILED failed."
+
+[ "$FAILED" -eq 0 ]

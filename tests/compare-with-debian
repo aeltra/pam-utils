@@ -1,0 +1,112 @@
+#!/bin/sh
+#
+# Compares what pam-auth-update writes with what the program of Debian
+# writes for the same profiles. For a Debian host: it uses the program,
+# the templates and the profiles that are installed there. Debian's
+# program puts a blank at the end of a line without options, blanks at the
+# ends of lines are not compared.
+#
+# Run it from the top of the source tree, after "make".
+#
+
+set -e -u
+
+DEBIAN_PROGRAM="/usr/sbin/pam-auth-update"
+DEBIAN_TEMPLATES="/usr/share/pam"
+DEBIAN_PROFILES="/usr/share/pam-configs"
+
+if [ ! -x "$DEBIAN_PROGRAM" ] || ! grep -q Debconf "$DEBIAN_PROGRAM"; then
+    echo "Debian's pam-auth-update is not installed, nothing to compare."
+    exit 0
+fi
+
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pam-utils-compare.XXXXXX")"
+trap 'rm -r "$WORK_DIR"' EXIT
+
+FAILED=0
+COUNT=0
+
+# $1: the profiles that are installed
+# $2: the ones of them that are enabled
+compare()
+{
+    COUNT=$((COUNT + 1))
+
+    _theirs="$WORK_DIR/$COUNT/theirs"
+    _ours="$WORK_DIR/$COUNT/ours"
+    _disabled=""
+
+    for _root in "$_theirs" "$_ours"; do
+        mkdir -p "$_root/usr/share/pam-configs" "$_root/usr/share/pam" \
+            "$_root/etc/pam.d" "$_root/var/lib/pam"
+
+        for _profile in $1; do
+            cp "$DEBIAN_PROFILES/$_profile" "$_root/usr/share/pam-configs/"
+        done
+    done
+
+    cp "$DEBIAN_TEMPLATES"/common-* "$_ours/usr/share/pam/"
+    rm -f "$_ours"/usr/share/pam/*.md5sums
+
+    for _profile in $1; do
+        case " $2 " in
+            *" $_profile "*)
+                ;;
+            *)
+                _disabled="$_disabled $_profile"
+                ;;
+        esac
+    done
+
+    # shellcheck disable=SC2086
+    DEBIAN_FRONTEND=noninteractive \
+        DEBCONF_DB_OVERRIDE="File{$WORK_DIR/$COUNT/config.dat}" \
+        "$DEBIAN_PROGRAM" --root "$_theirs" --force --enable $2 \
+            ${_disabled:+--disable $_disabled} 2> /dev/null || true
+
+    # Without root rights debconf cannot save its database and the program
+    # fails at its end, after the files were written.
+    if [ ! -f "$_theirs/etc/pam.d/common-auth" ]; then
+        echo "Debian's pam-auth-update did not write anything."
+        exit 1
+    fi
+
+    # shellcheck disable=SC2086
+    ./pam-auth-update --root "$_ours" --enable $2 \
+        ${_disabled:+--disable $_disabled}
+
+    for _file in "$_theirs"/etc/pam.d/common-*; do
+        sed 's/[ \t]*$//' "$_file" > "$_file.stripped"
+
+        if ! diff -u "$_file.stripped" "$_ours/etc/pam.d/${_file##*/}"; then
+            FAILED=$((FAILED + 1))
+        fi
+    done
+
+    echo "compared: installed \"$1\", enabled \"$2\""
+}
+
+ALL=""
+
+for FILE in "$DEBIAN_PROFILES"/*; do
+    ALL="$ALL ${FILE##*/}"
+done
+
+ALL="${ALL# }"
+
+compare "unix" "unix"
+compare "$ALL" "unix"
+compare "$ALL" "$ALL"
+
+for PROFILE in $ALL; do
+    if [ "$PROFILE" != "unix" ]; then
+        compare "$ALL" "unix $PROFILE"
+    fi
+done
+
+if [ "$FAILED" -ne 0 ]; then
+    echo "$FAILED files differ."
+    exit 1
+fi
+
+echo "All files are the same."

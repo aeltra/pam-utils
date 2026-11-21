@@ -1,0 +1,11 @@
+Name: Authentication with a token
+Default: yes
+Priority: 900
+Conflicts: rival
+Auth-Type: Primary
+Auth:
+	[success=end default=ignore]	pam_token.so
+	sufficient	pam_token_extra.so
+Auth-Initial:
+	[success=end default=ignore]	pam_token.so   first
+	sufficient	pam_token_extra.so

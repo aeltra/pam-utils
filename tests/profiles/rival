@@ -1,0 +1,6 @@
+Name: Another way to authenticate with a token
+Default: yes
+Priority: 800
+Auth-Type: Primary
+Auth:
+	[success=end default=ignore]	pam_rival.so

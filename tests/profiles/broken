@@ -1,0 +1,6 @@
+Name: A profile with a line that is none
+Default: yes
+Priority: 10
+Session-Type: Additional
+Session:
+	pam_nothing.so
