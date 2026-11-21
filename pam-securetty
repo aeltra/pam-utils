@@ -1,0 +1,509 @@
+#!/bin/sh
+#
+# pam-securetty
+#
+# Restricts logins of root to the consoles of this machine. "enable" writes
+# the list of these terminals to /etc/securetty and adds pam_securetty to
+# the PAM configuration of login, "disable" takes both away again, "status"
+# tells which of the two it is.
+#
+# The list is not a fixed one, it is put together from what is found on the
+# machine:
+#
+#   * the virtual terminals tty1 to tty12, if the kernel has them
+#   * the consoles of the kernel (/sys/class/tty/console/active)
+#   * the terminals a getty is configured for, in /etc/inittab or as an
+#     OpenRC service (/etc/init.d/agetty.<terminal>)
+#   * the lines of /etc/securetty.local, for everything else
+#
+# pam_securetty allows the consoles of the kernel by itself. They are listed
+# anyway, so that the file says what is allowed.
+#
+# Run "enable" again after a getty has been added for another terminal.
+# Nothing is done in a container, which has no console of its own: root
+# could not log in there any more. The option -f overrides this.
+#
+# This only concerns login. It has no effect on su, sudo or ssh.
+#
+# This file is in the public domain.
+#
+
+###############################################################################
+# Settings
+###############################################################################
+
+# For trying the script on a directory tree that is not the running system.
+ROOT="${SECURETTY_ROOT:-}"
+
+SECURETTY_FILE="$ROOT/etc/securetty"
+SECURETTY_LOCAL="$ROOT/etc/securetty.local"
+INITTAB_FILE="$ROOT/etc/inittab"
+INITD_DIR="$ROOT/etc/init.d"
+PAM_LOGIN_FILE="$ROOT/etc/pam.d/login"
+SYS_TTY_DIR="$ROOT/sys/class/tty"
+
+LAST_VIRTUAL_TERMINAL=12
+
+SECURETTY_HEADER="# Written by pam-securetty, see there. Changes get lost, \
+additions go to /etc/securetty.local."
+
+PAM_CREATED="# Created by \"pam-securetty enable\", removed by \"pam-securetty \
+disable\"."
+PAM_MARKER="# Added by \"pam-securetty enable\", removed by \"pam-securetty \
+disable\"."
+PAM_LINE="auth [success=ok new_authtok_reqd=ok ignore=ignore user_unknown=bad \
+default=die] pam_securetty.so"
+
+PROGRAM="${0##*/}"
+FORCE="no"
+TERMINALS=""
+
+###############################################################################
+# Helpers
+###############################################################################
+
+usage()
+{
+    cat <<USAGE
+Restricts logins of root to the consoles of this machine, or lifts that
+restriction again.
+
+USAGE:
+
+  pam-securetty [-h] <command> [OPTIONS]
+
+COMMANDS:
+
+  enable [-f]   Write /etc/securetty and add pam_securetty to the PAM
+                configuration of login. Run it again when the terminals
+                have changed.
+  disable       Take both away again.
+  status        Tell whether the restriction is in place, and for which
+                terminals.
+
+OPTIONS:
+
+  -h            Print this help message.
+  -f            Enable it even if this looks like a container or no
+                console is found.
+
+The terminals are found on the machine, see the comment at the top of
+$0. Additional ones can be listed in /etc/securetty.local,
+one per line and without "/dev/".
+USAGE
+}
+
+die()
+{
+    echo "$PROGRAM: error: $1" >&2
+    exit 1
+}
+
+info()
+{
+    echo "$PROGRAM: $1"
+}
+
+# Adds a terminal to the list, unless it is there already.
+add_terminal()
+{
+    case "
+$TERMINALS
+" in
+        *"
+$1
+"*)
+            ;;
+        *)
+            if [ -z "$TERMINALS" ]; then
+                TERMINALS="$1"
+            else
+                TERMINALS="$TERMINALS
+$1"
+            fi
+            ;;
+    esac
+}
+
+is_terminal()
+{
+    [ -e "$SYS_TTY_DIR/$1" ]
+}
+
+is_container()
+{
+    [ -e "$ROOT/.dockerenv" ] && return 0
+    [ -e "$ROOT/run/.containerenv" ] && return 0
+    [ -e "$ROOT/run/systemd/container" ] && return 0
+
+    if [ -r "$ROOT/proc/1/environ" ] && \
+            tr '\0' '\n' < "$ROOT/proc/1/environ" | grep -q '^container='; then
+        return 0
+    fi
+
+    return 1
+}
+
+###############################################################################
+# Finding the terminals
+###############################################################################
+
+collect_virtual_terminals()
+{
+    local number=1
+
+    # tty0 is the virtual terminal that is in the foreground.
+    is_terminal "tty0" || return 0
+
+    while [ "$number" -le "$LAST_VIRTUAL_TERMINAL" ]; do
+        add_terminal "tty$number"
+        number=$((number + 1))
+    done
+}
+
+collect_kernel_consoles()
+{
+    local name=""
+
+    add_terminal "console"
+
+    [ -r "$SYS_TTY_DIR/console/active" ] || return 0
+
+    for name in $(cat "$SYS_TTY_DIR/console/active"); do
+        if [ "$name" != "tty0" ]; then
+            add_terminal "$name"
+        fi
+    done
+}
+
+# The terminals that are named on the getty lines of /etc/inittab, be it
+# the format of busybox or of sysvinit.
+collect_inittab_gettys()
+{
+    local line=""
+    local word=""
+
+    [ -r "$INITTAB_FILE" ] || return 0
+
+    while read -r line; do
+        case "$line" in
+            "#"*|"")
+                continue
+                ;;
+            *getty*)
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        for word in $(echo "$line" | tr ':' ' '); do
+            word="${word#/dev/}"
+
+            case "$word" in
+                */*|-*|*[!A-Za-z0-9_]*)
+                    continue
+                    ;;
+            esac
+
+            if is_terminal "$word"; then
+                add_terminal "$word"
+            fi
+        done
+    done < "$INITTAB_FILE"
+}
+
+# OpenRC has one service per terminal, named agetty.<terminal>.
+collect_openrc_gettys()
+{
+    local service=""
+    local name=""
+
+    for service in "$INITD_DIR"/agetty.* "$INITD_DIR"/getty.*; do
+        [ -e "$service" ] || [ -L "$service" ] || continue
+
+        name="${service##*/}"
+        name="${name#*.}"
+
+        if is_terminal "$name"; then
+            add_terminal "$name"
+        fi
+    done
+}
+
+collect_local_terminals()
+{
+    local line=""
+
+    [ -r "$SECURETTY_LOCAL" ] || return 0
+
+    while read -r line; do
+        case "$line" in
+            "#"*|"")
+                continue
+                ;;
+        esac
+
+        add_terminal "${line#/dev/}"
+    done < "$SECURETTY_LOCAL"
+}
+
+###############################################################################
+# /etc/securetty
+###############################################################################
+
+securetty_is_ours()
+{
+    [ -f "$SECURETTY_FILE" ] && \
+        [ "$(head -n 1 "$SECURETTY_FILE")" = "$SECURETTY_HEADER" ]
+}
+
+write_securetty()
+{
+    local tmp_file="$SECURETTY_FILE.$$"
+
+    if [ -e "$SECURETTY_FILE" ] && ! securetty_is_ours; then
+        die "$SECURETTY_FILE was not written by this program. Move it to \
+/etc/securetty.local, or remove it."
+    fi
+
+    # pam_securetty compares whole lines, the comment matches no terminal.
+    {
+        echo "$SECURETTY_HEADER"
+        echo "$TERMINALS"
+    } > "$tmp_file"
+
+    chmod 0644 "$tmp_file"
+    mv "$tmp_file" "$SECURETTY_FILE"
+}
+
+remove_securetty()
+{
+    if [ ! -e "$SECURETTY_FILE" ]; then
+        return 0
+    fi
+
+    if ! securetty_is_ours; then
+        info "$SECURETTY_FILE was not written by this program, it stays."
+        return 0
+    fi
+
+    rm -f "$SECURETTY_FILE"
+}
+
+###############################################################################
+# PAM configuration of login
+###############################################################################
+
+# Without a file of its own, login uses /etc/pam.d/other. The new file does
+# the same, after it has asked pam_securetty.
+new_pam_login_file()
+{
+    cat <<PAM
+$PAM_CREATED
+$PAM_MARKER
+$PAM_LINE
+auth       include    other
+account    include    other
+password   include    other
+session    include    other
+PAM
+}
+
+enable_pam_securetty()
+{
+    local tmp_file="$PAM_LOGIN_FILE.$$"
+
+    if [ ! -e "$PAM_LOGIN_FILE" ]; then
+        mkdir -p "${PAM_LOGIN_FILE%/*}"
+        new_pam_login_file > "$tmp_file"
+        chmod 0644 "$tmp_file"
+        mv "$tmp_file" "$PAM_LOGIN_FILE"
+        return 0
+    fi
+
+    if grep -q 'pam_securetty' "$PAM_LOGIN_FILE"; then
+        if ! grep -qxF "$PAM_MARKER" "$PAM_LOGIN_FILE"; then
+            info "$PAM_LOGIN_FILE has pam_securetty already, it stays as it is."
+        fi
+        return 0
+    fi
+
+    # Before the first auth line: who may not log in on this terminal is
+    # not asked for a password.
+    awk -v marker="$PAM_MARKER" -v line="$PAM_LINE" '
+        !done && /^-?auth[ \t]/ {
+            print marker
+            print line
+            done = 1
+        }
+        { print }
+        END {
+            if (!done) {
+                print marker
+                print line
+            }
+        }
+    ' "$PAM_LOGIN_FILE" > "$tmp_file"
+
+    chmod 0644 "$tmp_file"
+    mv "$tmp_file" "$PAM_LOGIN_FILE"
+}
+
+disable_pam_securetty()
+{
+    local tmp_file="$PAM_LOGIN_FILE.$$"
+
+    [ -e "$PAM_LOGIN_FILE" ] || return 0
+
+    # The file as we created it goes away as a whole. If it has been
+    # changed since, only our two lines do.
+    if [ "$(cat "$PAM_LOGIN_FILE")" = "$(new_pam_login_file)" ]; then
+        rm -f "$PAM_LOGIN_FILE"
+        return 0
+    fi
+
+    if ! grep -qxF "$PAM_MARKER" "$PAM_LOGIN_FILE"; then
+        if grep -q 'pam_securetty' "$PAM_LOGIN_FILE"; then
+            info "The pam_securetty line in $PAM_LOGIN_FILE was not added by \
+this program, it stays."
+        fi
+        return 0
+    fi
+
+    grep -vxF -e "$PAM_MARKER" -e "$PAM_LINE" -e "$PAM_CREATED" \
+        "$PAM_LOGIN_FILE" > "$tmp_file" || true
+
+    chmod 0644 "$tmp_file"
+    mv "$tmp_file" "$PAM_LOGIN_FILE"
+}
+
+###############################################################################
+# Actions
+###############################################################################
+
+do_enable()
+{
+    if [ "$FORCE" != "yes" ]; then
+        if is_container; then
+            die "this looks like a container, which has no console of its \
+own. Root could not log in any more. Use -f to do it anyway."
+        fi
+
+        if [ ! -s "$SYS_TTY_DIR/console/active" ]; then
+            die "the kernel reports no console \
+(/sys/class/tty/console/active). Use -f to do it anyway."
+        fi
+    fi
+
+    collect_virtual_terminals
+    collect_kernel_consoles
+    collect_inittab_gettys
+    collect_openrc_gettys
+    collect_local_terminals
+
+    write_securetty
+    enable_pam_securetty
+
+    info "root may log in on: $(echo "$TERMINALS" | tr '\n' ' ')"
+}
+
+do_disable()
+{
+    disable_pam_securetty
+    remove_securetty
+
+    info "root may log in on any terminal."
+}
+
+# The restriction is in place when login asks pam_securetty and there is a
+# list. Without the list, pam_securetty lets everybody through.
+do_status()
+{
+    local line=""
+    local pattern='^-\{0,1\}auth[[:space:]].*pam_securetty'
+
+    if [ ! -e "$PAM_LOGIN_FILE" ] || \
+            ! grep -q "$pattern" "$PAM_LOGIN_FILE"; then
+        info "disabled, login does not ask pam_securetty."
+        return 0
+    fi
+
+    if [ ! -e "$SECURETTY_FILE" ]; then
+        info "disabled, there is no $SECURETTY_FILE."
+        return 0
+    fi
+
+    while read -r line; do
+        case "$line" in
+            "#"*|"")
+                ;;
+            *)
+                add_terminal "$line"
+                ;;
+        esac
+    done < "$SECURETTY_FILE"
+
+    info "enabled, root may log in on: $(echo "$TERMINALS" | tr '\n' ' ')"
+
+    if ! securetty_is_ours; then
+        info "$SECURETTY_FILE was not written by this program."
+    fi
+}
+
+###############################################################################
+# Main
+###############################################################################
+
+COMMAND=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -f)
+            FORCE="yes"
+            ;;
+        enable|disable|status)
+            if [ -n "$COMMAND" ]; then
+                usage >&2
+                exit 1
+            fi
+            COMMAND="$1"
+            ;;
+        *)
+            usage >&2
+            exit 1
+            ;;
+    esac
+
+    shift
+done
+
+if [ -z "$COMMAND" ]; then
+    usage >&2
+    exit 1
+fi
+
+if [ "$FORCE" = "yes" ] && [ "$COMMAND" != "enable" ]; then
+    usage >&2
+    exit 1
+fi
+
+if [ "$COMMAND" != "status" ] && [ -z "$ROOT" ] && [ "$(id -u)" -ne 0 ]; then
+    die "this needs to be run as root."
+fi
+
+case "$COMMAND" in
+    enable)
+        do_enable
+        ;;
+    disable)
+        do_disable
+        ;;
+    status)
+        do_status
+        ;;
+esac
